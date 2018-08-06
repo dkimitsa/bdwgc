@@ -27,13 +27,15 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h> /* for exit() */
+
 #include "gc.h"
 #include "cord.h"
 
 #ifdef THINK_C
 #define MACINTOSH
-#include <ctype.h>
 #endif
+#include <ctype.h>
 
 #if (defined(__BORLANDC__) || defined(__CYGWIN__)) && !defined(WIN32)
     /* If this is DOS or win16, we'll fail anyway.      */
@@ -42,6 +44,10 @@
 #endif
 
 #if defined(WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN 1
+#  endif
+#  define NOSERVICE
 #  include <windows.h>
 #  include "de_win.h"
 #elif defined(MACINTOSH)
@@ -63,9 +69,15 @@
 #       define COLS 80
 #else
 #  include <curses.h>
+#  include <unistd.h> /* for sleep() */
 #  define de_error(s) { fprintf(stderr, s); sleep(2); }
 #endif
 #include "de_cmds.h"
+
+#define OUT_OF_MEMORY do { \
+                        fprintf(stderr, "Out of memory\n"); \
+                        exit(3); \
+                      } while (0)
 
 /* List of line number to position mappings, in descending order. */
 /* There may be holes.                                            */
@@ -125,21 +137,26 @@ void prune_map(void)
     do {
         current_map_size++;
         if (map -> line < start_line - LINES && map -> previous != 0) {
-            map -> previous = map -> previous -> previous;
+            line_map pred = map -> previous -> previous;
+
+            GC_PTR_STORE_AND_DIRTY(&map->previous, pred);
         }
         map = map -> previous;
     } while (map != 0);
 }
 
 /* Add mapping entry */
-void add_map(int line, size_t pos)
+void add_map(int line_arg, size_t pos)
 {
     line_map new_map = GC_NEW(struct LineMapRep);
+    line_map cur_map;
 
+    if (NULL == new_map) OUT_OF_MEMORY;
     if (current_map_size >= MAX_MAP_SIZE) prune_map();
-    new_map -> line = line;
+    new_map -> line = line_arg;
     new_map -> pos = pos;
-    new_map -> previous = current_map;
+    cur_map = current_map;
+    GC_PTR_STORE_AND_DIRTY(&new_map->previous, cur_map);
     current_map = new_map;
     current_map_size++;
 }
@@ -155,7 +172,6 @@ size_t line_pos(int i, int *c)
 {
     int j;
     size_t cur;
-    size_t next;
     line_map map = current_map;
 
     while (map -> line > i) map = map -> previous;
@@ -167,10 +183,11 @@ size_t line_pos(int i, int *c)
         if (++j > current_map -> line) add_map(j, cur);
     }
     if (c != 0) {
-        next = CORD_chr(current, cur, '\n');
+        size_t next = CORD_chr(current, cur, '\n');
+
         if (next == CORD_NOT_FOUND) next = current_len - 1;
         if (next < cur + *c) {
-            *c = next - cur;
+            *c = (int)(next - cur);
         }
         cur += *c;
     }
@@ -181,10 +198,15 @@ void add_hist(CORD s)
 {
     history new_file = GC_NEW(struct HistoryRep);
 
+    if (NULL == new_file) OUT_OF_MEMORY;
     new_file -> file_contents = current = s;
     current_len = CORD_len(s);
     new_file -> previous = now;
-    if (now != 0) now -> map = current_map;
+    GC_END_STUBBORN_CHANGE(new_file);
+    if (now != NULL) {
+        now -> map = current_map;
+        GC_END_STUBBORN_CHANGE(now);
+    }
     now = new_file;
 }
 
@@ -206,7 +228,6 @@ int screen_size = 0;
 /* terribly appropriate for tabs.                                                                       */
 void replace_line(int i, CORD s)
 {
-    register int c;
     CORD_pos p;
 #   if !defined(MACINTOSH)
         size_t len = CORD_len(s);
@@ -215,10 +236,11 @@ void replace_line(int i, CORD s)
     if (screen == 0 || LINES > screen_size) {
         screen_size = LINES;
         screen = (CORD *)GC_MALLOC(screen_size * sizeof(CORD));
+        if (NULL == screen) OUT_OF_MEMORY;
     }
 #   if !defined(MACINTOSH)
         /* A gross workaround for an apparent curses bug: */
-        if (i == LINES-1 && len == COLS) {
+        if (i == LINES-1 && len == (unsigned)COLS) {
             s = CORD_substr(s, 0, len - 1);
         }
 #   endif
@@ -226,14 +248,15 @@ void replace_line(int i, CORD s)
         move(i, 0); clrtoeol(); move(i,0);
 
         CORD_FOR (p, s) {
-            c = CORD_pos_fetch(p) & 0x7f;
+            int c = CORD_pos_fetch(p) & 0x7f;
+
             if (iscntrl(c)) {
                 standout(); addch(c + 0x40); standend();
             } else {
                 addch(c);
             }
         }
-        screen[i] = s;
+        GC_PTR_STORE_AND_DIRTY(screen + i, s);
     }
 }
 #else
@@ -260,7 +283,7 @@ CORD retrieve_line(CORD s, size_t pos, unsigned column)
 
     CORD retrieve_screen_line(int i)
     {
-        register size_t pos;
+        size_t pos;
 
         invalidate_map(dis_line + LINES);       /* Prune search */
         pos = line_pos(dis_line + i, 0);
@@ -272,12 +295,12 @@ CORD retrieve_line(CORD s, size_t pos, unsigned column)
 /* Display the visible section of the current file       */
 void redisplay(void)
 {
-    register int i;
+    int i;
 
     invalidate_map(dis_line + LINES);   /* Prune search */
     for (i = 0; i < LINES; i++) {
         if (need_redisplay == ALL || need_redisplay == i) {
-            register size_t pos = line_pos(dis_line + i, 0);
+            size_t pos = line_pos(dis_line + i, 0);
 
             if (pos == CORD_NOT_FOUND) break;
             replace_line(i, retrieve_line(current, pos, dis_col));
@@ -336,7 +359,8 @@ void fix_pos(void)
 {
     int my_col = col;
 
-    if ((size_t)line > current_len) line = current_len;
+    if ((size_t)line > current_len)
+        line = (int)current_len;
     file_pos = line_pos(line, &my_col);
     if (file_pos == CORD_NOT_FOUND) {
         for (line = current_map -> line, file_pos = current_map -> pos;
@@ -417,7 +441,7 @@ void do_command(int c)
                 if (file_pos > new_pos) break;
                 line++;
             }
-            col = new_pos - line_pos(line, 0);
+            col = (int)(new_pos - line_pos(line, 0));
             file_pos = new_pos;
             fix_cursor();
         } else {
@@ -448,7 +472,8 @@ void do_command(int c)
             locate_mode = 1;
             break;
           case TOP:
-            line = col = file_pos = 0;
+            line = col = 0;
+            file_pos = 0;
             break;
           case UP:
             if (line != 0) {
@@ -479,7 +504,7 @@ void do_command(int c)
                 break;
             }
             col--; file_pos--;
-            /* fall through: */
+            /* FALLTHRU */
           case DEL:
             if (file_pos == current_len-1) break;
                 /* Can't delete trailing newline */
@@ -541,9 +566,11 @@ void generic_init(void)
     if ((f = fopen(arg_file_name, "rb")) == NULL) {
         initial = "\n";
     } else {
+        size_t len;
+
         initial = CORD_from_file(f);
-        if (initial == CORD_EMPTY
-            || CORD_fetch(initial, CORD_len(initial)-1) != '\n') {
+        len = CORD_len(initial);
+        if (0 == len || CORD_fetch(initial, len - 1) != '\n') {
             initial = CORD_cat(initial, "\n");
         }
     }
@@ -551,50 +578,54 @@ void generic_init(void)
     add_hist(initial);
     now -> map = current_map;
     now -> previous = now;  /* Can't back up further: beginning of the world */
+    GC_END_STUBBORN_CHANGE(now);
     need_redisplay = ALL;
     fix_cursor();
 }
 
 #ifndef WIN32
 
-main(argc, argv)
-int argc;
-char ** argv;
+int main(int argc, char **argv)
 {
     int c;
+    void *buf;
 
-#if defined(MACINTOSH)
+#   if defined(MACINTOSH)
         console_options.title = "\pDumb Editor";
         cshow(stdout);
         argc = ccommand(&argv);
-#endif
+#   endif
     GC_INIT();
+#   ifndef NO_INCREMENTAL
+      GC_enable_incremental();
+#   endif
 
-    if (argc != 2) goto usage;
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s file\n", argv[0]);
+        fprintf(stderr, "Cursor keys: ^B(left) ^F(right) ^P(up) ^N(down)\n");
+        fprintf(stderr, "Undo: ^U    Write to <file>.new: ^W");
+        fprintf(stderr, "Quit:^D     Repeat count: ^R[n]\n");
+        fprintf(stderr, "Top: ^T     Locate (search, find): ^L text ^L\n");
+        exit(1);
+    }
     arg_file_name = argv[1];
-    setvbuf(stdout, GC_MALLOC_ATOMIC(8192), _IOFBF, 8192);
+    buf = GC_MALLOC_ATOMIC(8192);
+    if (NULL == buf) OUT_OF_MEMORY;
+    setvbuf(stdout, (char *)buf, _IOFBF, 8192);
     initscr();
     noecho(); nonl(); cbreak();
     generic_init();
     while ((c = getchar()) != QUIT) {
-                if (c == EOF) break;
-            do_command(c);
+        if (c == EOF) break;
+        do_command(c);
     }
-done:
     move(LINES-1, 0);
     clrtoeol();
     refresh();
     nl();
     echo();
     endwin();
-    exit(0);
-usage:
-    fprintf(stderr, "Usage: %s file\n", argv[0]);
-    fprintf(stderr, "Cursor keys: ^B(left) ^F(right) ^P(up) ^N(down)\n");
-    fprintf(stderr, "Undo: ^U    Write to <file>.new: ^W");
-    fprintf(stderr, "Quit:^D  Repeat count: ^R[n]\n");
-    fprintf(stderr, "Top: ^T   Locate (search, find): ^L text ^L\n");
-    exit(1);
+    return 0;
 }
 
 #endif  /* !WIN32 */
