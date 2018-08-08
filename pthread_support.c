@@ -352,6 +352,11 @@ STATIC void * GC_mark_thread(void * id)
     marker_mach_threads[(word)id] = mach_thread_self();
 # endif
 
+  /* Inform GC_start_mark_threads about completion of marker data init. */
+  GC_acquire_mark_lock();
+  if (0 == --GC_fl_builder_count) /* count may have a negative value */
+    GC_notify_all_builder();
+
   for (;; ++my_mark_no) {
     /* GC_mark_no is passed only to allow GC_help_marker to terminate   */
     /* promptly.  This is important if it were called from the signal   */

@@ -786,6 +786,13 @@ GC_INNER mse * GC_mark_from(mse *mark_stack_top, mse *mark_stack,
                 mark_stack_top--;
                 continue;
             }
+            /*
+            RoboVM added: Added a check in GC_mark_from() for GC_DS_PER_OBJECT objects with negative
+            descriptors to prevent mistaking the free list pointers in free objects for
+            being type descriptor pointers. If the specified descriptor offset was larger
+            than the object size this could lead to arbitrary data from allocated objects
+            being misinterpreted as descriptors and the process crashing.
+            */
             if ((GC_word)(type_descr) >= (GC_word)GC_least_plausible_heap_addr
                     && (GC_word)(type_descr)
                         <= (GC_word)GC_greatest_plausible_heap_addr) {
@@ -806,6 +813,7 @@ GC_INNER mse * GC_mark_from(mse *mark_stack_top, mse *mark_stack,
                     continue;
                 }
             }
+            /* end of RoboVM added */
             descr = *(word *)(type_descr
                               - ((signed_word)descr + (GC_INDIR_PER_OBJ_BIAS
                                                        - GC_DS_PER_OBJECT)));
